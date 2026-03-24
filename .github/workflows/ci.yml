@@ -1,0 +1,253 @@
+name: Smart Contract Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# 🔐 REQUIRED PERMISSIONS
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 0: CHECK IF CONTRACTS EXIST
+  # ─────────────────────────────────────────────
+  check-contracts:
+    runs-on: ubuntu-latest
+    outputs:
+      has_contracts: ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if ls contracts/*.sol 1> /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ─────────────────────────────────────────────
+  # JOB 1: SLITHER + AI FIX (GitHub Models)
+  # ─────────────────────────────────────────────
+  slither:
+    name: Slither Static Analysis
+    runs-on: ubuntu-latest
+    needs: check-contracts
+    if: needs.check-contracts.outputs.has_contracts == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Slither
+        run: pip install slither-analyzer
+
+      - name: Run Slither (JSON)
+        run: |
+          slither contracts/ \
+            --json slither-report.json \
+            --exclude-dependencies \
+            --exclude-informational || true
+
+      - name: Run Slither (SARIF)
+        run: |
+          slither contracts/ \
+            --sarif results.sarif || true
+
+      # 🤖 AI FIX SUGGESTIONS (GitHub Models)
+      - name: Generate Fix Suggestions (AI)
+        if: hashFiles('slither-report.json') != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import json, requests, os
+
+          with open("slither-report.json") as f:
+              data = json.load(f)
+
+          findings = data.get("results", {}).get("detectors", [])
+
+          if not findings:
+              with open("fix-suggestions.md", "w") as f:
+                  f.write("✅ No issues found by Slither")
+              exit(0)
+
+          prompt = "You are a smart contract security expert. Suggest secure fixes:\n\n"
+
+          for fnd in findings[:10]:
+              prompt += f"- {fnd.get('check')} → {fnd.get('description')}\n"
+
+          response = requests.post(
+              "https://models.inference.ai.azure.com/chat/completions",
+              headers={
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "Content-Type": "application/json",
+              },
+              json={
+                  "model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": prompt}],
+              },
+          )
+
+          result = response.json()
+
+          with open("fix-suggestions.md", "w") as f:
+              f.write(result["choices"][0]["message"]["content"])
+          EOF
+
+      # 💬 COMMENT ON PR
+      - name: Comment PR with Fix Suggestions
+        if: github.event_name == 'pull_request' && hashFiles('fix-suggestions.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('fix-suggestions.md', 'utf8');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "## 🔐 AI Smart Contract Fix Suggestions\n\n" + body
+            });
+
+      - name: Upload SARIF to GitHub Security
+        if: hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+
+      - name: Upload Slither artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slither-reports
+          path: |
+            slither-report.json
+            results.sarif
+            fix-suggestions.md
+
+  # ─────────────────────────────────────────────
+  # JOB 2: MYTHRIL
+  # ─────────────────────────────────────────────
+  mythril:
+    name: Mythril Symbolic Execution
+    runs-on: ubuntu-latest
+    needs: check-contracts
+    if: needs.check-contracts.outputs.has_contracts == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Mythril
+        run: pip install mythril==0.24.7
+
+      - name: Run Mythril
+        run: |
+          mkdir -p mythril-reports
+          FAILED=0
+
+          if ls contracts/*.sol 1> /dev/null 2>&1; then
+            for contract in contracts/*.sol; do
+              echo "Analyzing $contract"
+
+              myth analyze "$contract" \
+                --execution-timeout 120 \
+                --output json \
+                > mythril-reports/$(basename "$contract" .sol).json 2>&1 || true
+
+              if grep -q '"severity": "High"' mythril-reports/*.json; then
+                echo "❌ HIGH issue found"
+                FAILED=1
+              fi
+            done
+          else
+            echo "No contracts found"
+          fi
+
+          exit $FAILED
+
+      - name: Upload Mythril reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: mythril-reports
+          path: mythril-reports/
+
+  # ─────────────────────────────────────────────
+  # JOB 3: SBOM + CVE SCAN
+  # ─────────────────────────────────────────────
+  sbom-scan:
+    name: SBOM + CVE Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM
+        run: syft packages . -o cyclonedx-json --file sbom.json
+
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Scan SBOM
+        run: grype sbom:sbom.json --fail-on high
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  # ─────────────────────────────────────────────
+  # JOB 4: DEPENDENCY AUDIT
+  # ─────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: npm audit
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+  # ─────────────────────────────────────────────
+  # FINAL SECURITY GATE
+  # ─────────────────────────────────────────────
+  security-gate:
+    runs-on: ubuntu-latest
+    needs: [slither, mythril, sbom-scan, dependency-audit]
+    if: always()
+
+    steps:
+      - name: Evaluate Results
+        run: |
+          echo "Slither:    ${{ needs.slither.result }}"
+          echo "Mythril:    ${{ needs.mythril.result }}"
+          echo "SBOM:       ${{ needs.sbom-scan.result }}"
+          echo "Dependency: ${{ needs.dependency-audit.result }}"
+
+          if [[ "${{ needs.slither.result }}" != "success" && "${{ needs.slither.result }}" != "skipped" ]] || \
+             [[ "${{ needs.mythril.result }}" != "success" && "${{ needs.mythril.result }}" != "skipped" ]] || \
+             [[ "${{ needs.sbom-scan.result }}" != "success" ]] || \
+             [[ "${{ needs.dependency-audit.result }}" != "success" ]]; then
+            echo "❌ Security gate FAILED"
+            exit 1
+          fi
+
+          echo "✅ All security checks passed"
