@@ -22,18 +22,12 @@ jobs:
         uses: crytic/slither-action@v0.4.0
         with:
           target: "."   # ✅ FIXED (scan entire repo)
-          slither-args: >
-            --exclude-dependencies
-            --exclude-informational
-            --detect reentrancy-eth,reentrancy-no-eth,tx-origin,
-            unprotected-upgrade,arbitrary-send-eth,
-            controlled-delegatecall,suicidal,
-            locked-ether,msg-value-loop
+          slither-args: 
           fail-on: high
           sarif: results.sarif
 
       - name: Upload SARIF
-        if: always()
+        if: always() && hashFiles('results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4   # ✅ FIXED
         with:
           sarif_file: results.sarif
