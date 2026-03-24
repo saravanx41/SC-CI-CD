@@ -7,7 +7,7 @@ contract CrowdFundBad {
 
   function refundDos() public {
     for(uint i; i < refundAddresses.length; i++) {
-      require(payable(refundAddresses[i]).transfer(refundAmount[refundAddresses[i]]));
+      payable(refundAddresses[i]).transfer(refundAmount[refundAddresses[i]]);
     }
   }
 }
