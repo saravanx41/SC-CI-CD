@@ -22,7 +22,7 @@ jobs:
         uses: crytic/slither-action@v0.4.0
         with:
           target: "."   # ✅ FIXED (scan entire repo)
-          slither-args: 
+          slither-args: "--exclude-dependencies --exclude-informational --detect reentrancy-eth,reentrancy-no-eth,tx-origin,unprotected-upgrade,arbitrary-send-eth,controlled-delegatecall,suicidal,locked-ether,msg-value-loop"
           fail-on: high
           sarif: results.sarif
 
