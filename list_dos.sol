@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.34;
 
 contract CrowdFundBad {
@@ -6,7 +7,7 @@ contract CrowdFundBad {
 
   function refundDos() public {
     for(uint i; i < refundAddresses.length; i++) {
-      require(refundAddresses[i].transfer(refundAmount[refundAddresses[i]]));
+      require(payable(refundAddresses[i]).transfer(refundAmount[refundAddresses[i]]));
     }
   }
 }
@@ -18,10 +19,9 @@ contract CrowdFundPull {
   function withdraw() external {
     uint refund = refundAmount[msg.sender];
     refundAmount[msg.sender] = 0;
-    msg.sender.transfer(refund);
+    payable(msg.sender).transfer(refund);
   }
 }
-
 
 //This is safe against the list length causing out of gas issues
 //but is not safe against the payee causing the execution to revert
@@ -33,7 +33,7 @@ contract CrowdFundSafe {
   function refundSafe() public {
     uint256 i = nextIdx;
     while(i < refundAddresses.length && msg.gas > 200000) {
-      refundAddresses[i].transfer(refundAmount[i]);
+      payable(refundAddresses[i]).transfer(refundAmount[i]);
       i++;
     }
     nextIdx = i;
