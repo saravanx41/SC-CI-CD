@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: check
         run: |
-          if ls contracts/*.sol 1> /dev/null 2>&1; then
+          if ls *.sol 1> /dev/null 2>&1 || ls contracts/*.sol 1> /dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
@@ -40,7 +40,7 @@ jobs:
 
       - name: Run Slither Analysis
         run: |
-          slither contracts/ \
+          slither . \
             --json slither-report.json \
             --exclude-dependencies \
             --exclude-informational || true
@@ -100,7 +100,7 @@ jobs:
 
       - name: Run Slither SARIF
         run: |
-          slither contracts/ \
+          slither . \
             --sarif results.sarif || true
 
       - name: Upload SARIF
@@ -138,7 +138,8 @@ jobs:
           mkdir -p mythril-reports
           FAILED=0
 
-          for contract in contracts/*.sol; do
+          for contract in *.sol contracts/*.sol; do
+            [ -f "$contract" ] || continue
             echo "🔍 Analyzing: $contract"
             myth analyze "$contract" \
               --execution-timeout 120 \
