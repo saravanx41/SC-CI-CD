@@ -31,7 +31,7 @@ contract theRun {
         Player[] private players;
 
         //--Fallback function
-        function() {
+        receive() external payable {
             init();
         }
 
