@@ -1,0 +1,206 @@
+name: Smart Contract Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: SLITHER – Static Analysis (fast, every PR)
+  # ─────────────────────────────────────────────
+  slither:
+    name: Slither Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Slither
+        uses: crytic/slither-action@v0.4.0
+        id: slither
+        with:
+          target: "contracts/"
+          slither-args: >
+            --exclude-dependencies
+            --exclude-informational
+            --detect reentrancy-eth,reentrancy-no-eth,tx-origin,
+            unprotected-upgrade,arbitrary-send-eth,
+            controlled-delegatecall,suicidal,
+            locked-ether,msg-value-loop
+          fail-on: high           # ← blocks merge on HIGH findings
+          sarif: results.sarif    # ← uploads to GitHub Security tab
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()             # upload even if slither found issues
+        with:
+          sarif_file: results.sarif
+
+      - name: Save Slither report as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slither-report
+          path: results.sarif
+
+  # ─────────────────────────────────────────────
+  # JOB 2: MYTHRIL – Symbolic Execution (deeper, pre-deploy)
+  # ─────────────────────────────────────────────
+  mythril:
+    name: Mythril Symbolic Execution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Mythril
+        run: |
+          pip install mythril==0.24.7
+          myth version
+
+      - name: Run Mythril on all contracts
+        run: |
+          mkdir -p mythril-reports
+          FAILED=0
+
+          for contract in contracts/*.sol; do
+            echo "=========================================="
+            echo "Analyzing: $contract"
+            echo "=========================================="
+
+            myth analyze "$contract" \
+              --solc-version 0.8.0 \
+              --execution-timeout 120 \
+              --output json \
+              > mythril-reports/$(basename "$contract" .sol)-report.json 2>&1 || true
+
+            # Check severity in output - fail on High
+            if grep -q '"severity": "High"' mythril-reports/$(basename "$contract" .sol)-report.json; then
+              echo "❌ HIGH severity issue found in $contract"
+              FAILED=1
+            else
+              echo "✅ No HIGH issues in $contract"
+            fi
+
+            # Pretty print summary
+            cat mythril-reports/$(basename "$contract" .sol)-report.json
+          done
+
+          exit $FAILED   # fails the job if any HIGH found
+
+      - name: Upload Mythril reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mythril-reports
+          path: mythril-reports/
+
+  # ─────────────────────────────────────────────
+  # JOB 3: SBOM + CVE SCAN (Syft + Grype)
+  # ─────────────────────────────────────────────
+  sbom-scan:
+    name: SBOM Generation + CVE Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Syft (SBOM generator)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM (CycloneDX format)
+        run: |
+          syft packages . \
+            -o cyclonedx-json \
+            --file sbom.json
+          echo "✅ SBOM generated"
+          cat sbom.json | python3 -m json.tool | head -60  # preview
+
+      - name: Install Grype (CVE scanner)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Scan SBOM for CVEs
+        run: |
+          grype sbom:sbom.json \
+            --fail-on high \
+            -o table
+          # exits non-zero (fails job) if HIGH or CRITICAL CVEs found
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+
+  # ─────────────────────────────────────────────
+  # JOB 4: DEPENDENCY AUDIT (npm/go)
+  # ─────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # npm audit (if package.json exists)
+      - name: npm audit
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      # Go mod audit (if go.mod exists - likely for 0G node)
+      - name: Set up Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Go vulnerability check
+        if: hashFiles('go.mod') != ''
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ─────────────────────────────────────────────
+  # FINAL GATE: All jobs must pass before merge
+  # ─────────────────────────────────────────────
+  security-gate:
+    name: Security Gate (All Must Pass)
+    runs-on: ubuntu-latest
+    needs: [slither, mythril, sbom-scan, dependency-audit]
+    if: always()
+
+    steps:
+      - name: Check all security jobs passed
+        run: |
+          echo "Slither:    ${{ needs.slither.result }}"
+          echo "Mythril:    ${{ needs.mythril.result }}"
+          echo "SBOM Scan:  ${{ needs.sbom-scan.result }}"
+          echo "Dep Audit:  ${{ needs.dependency-audit.result }}"
+
+          if [[ "${{ needs.slither.result }}"      != "success" ]] || \
+             [[ "${{ needs.mythril.result }}"      != "success" ]] || \
+             [[ "${{ needs.sbom-scan.result }}"    != "success" ]] || \
+             [[ "${{ needs.dependency-audit.result }}" != "success" ]]; then
+            echo "❌ Security gate FAILED – merge blocked"
+            exit 1
+          fi
+
+          echo "✅ All security checks passed – merge allowed"
