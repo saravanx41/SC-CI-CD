@@ -12,26 +12,39 @@ permissions:
   security-events: write
 
 jobs:
-  # ─────────────────────────────────────────────
-  # JOB 0: CHECK IF CONTRACTS EXIST
-  # ─────────────────────────────────────────────
   check-contracts:
+    name: Check Solidity Files
     runs-on: ubuntu-latest
     outputs:
       has_contracts: ${{ steps.check.outputs.exists }}
+      contract_list: ${{ steps.check.outputs.contract_list }}
     steps:
       - uses: actions/checkout@v4
+
       - id: check
+        shell: bash
         run: |
-          if ls *.sol 1> /dev/null 2>&1 || ls contracts/*.sol 1> /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          mapfile -t files < <(find . -type f -name "*.sol" ! -path "./node_modules/*" | sort)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "contract_list=" >> "$GITHUB_OUTPUT"
+            echo "No Solidity files found"
+            exit 0
           fi
 
-  # ─────────────────────────────────────────────
-  # JOB 1: SLITHER (FIXED)
-  # ─────────────────────────────────────────────
+          printf 'Found Solidity files:\n'
+          printf '  %s\n' "${files[@]}"
+
+          {
+            echo "exists=true"
+            echo "contract_list<<EOF"
+            printf '%s\n' "${files[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   slither:
     name: Slither Static Analysis
     runs-on: ubuntu-latest
@@ -41,115 +54,144 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install Slither
-        run: pip install slither-analyzer
-
-      # ✅ FIXED SLITHER EXECUTION
-      - name: Run Slither Analysis
         run: |
-          TARGET=""
+          python -m pip install --upgrade pip
+          pip install slither-analyzer
 
-          if ls contracts/*.sol 1> /dev/null 2>&1; then
-            TARGET="contracts/"
-          elif ls *.sol 1> /dev/null 2>&1; then
-            TARGET="."
-          else
-            echo "⚠️ No Solidity files found"
-            echo '{"results": {"detectors": []}}' > slither-report.json
-            exit 0
+      - name: Run Slither on each Solidity file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p slither-reports
+          mkdir -p slither-sarif
+
+          had_analysis_error=0
+          had_findings=0
+
+          while IFS= read -r contract; do
+            [ -n "$contract" ] || continue
+
+            base="$(basename "$contract" .sol)"
+            json_out="slither-reports/${base}.json"
+            sarif_out="slither-sarif/${base}.sarif"
+
+            echo "=================================================="
+            echo "Analyzing: $contract"
+            echo "=================================================="
+
+            # Do NOT use `|| true` here. If Slither cannot analyze the file,
+            # we want to know and mark the job accordingly.
+            if ! slither "$contract" \
+              --json "$json_out" \
+              --sarif "$sarif_out" \
+              --exclude-dependencies \
+              --exclude-informational; then
+              echo "❌ Slither failed to analyze $contract"
+              had_analysis_error=1
+              continue
+            fi
+
+            if [ ! -s "$json_out" ]; then
+              echo "❌ Missing or empty JSON report for $contract"
+              had_analysis_error=1
+              continue
+            fi
+
+            python3 - "$json_out" << 'PY'
+import json, sys
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# Slither JSON top-level structure includes success/error/results. :contentReference[oaicite:3]{index=3}
+success = data.get("success", True)
+error = data.get("error")
+detectors = data.get("results", {}).get("detectors", [])
+
+if success is False or error:
+    print(f"❌ Slither reported analysis error in {path}: {error}")
+    sys.exit(2)
+
+high = []
+medium_high_conf = []
+
+for d in detectors:
+    impact = str(d.get("impact", "")).lower()
+    confidence = str(d.get("confidence", "")).lower()
+    check = d.get("check", "Unknown")
+    description = str(d.get("description", "")).strip().replace("\n", " ")
+
+    if impact == "high":
+        high.append((check, description[:160]))
+    elif impact == "medium" and confidence == "high":
+        medium_high_conf.append((check, description[:160]))
+
+print(f"Detectors returned: {len(detectors)}")
+
+if high:
+    print(f"🔴 HIGH findings: {len(high)}")
+    for check, desc in high:
+        print(f"  [{check}] {desc}")
+    sys.exit(10)
+
+if medium_high_conf:
+    print(f"🟠 MEDIUM/HIGH-CONFIDENCE findings: {len(medium_high_conf)}")
+    for check, desc in medium_high_conf:
+        print(f"  [{check}] {desc}")
+    sys.exit(11)
+
+print("✅ No HIGH or MEDIUM/HIGH-CONFIDENCE findings in this file")
+PY
+
+            rc=$?
+            if [ "$rc" -eq 10 ] || [ "$rc" -eq 11 ]; then
+              had_findings=1
+            elif [ "$rc" -eq 2 ]; then
+              had_analysis_error=1
+            elif [ "$rc" -ne 0 ]; then
+              had_analysis_error=1
+            fi
+
+          done <<< "${{ needs.check-contracts.outputs.contract_list }}"
+
+          echo "had_analysis_error=$had_analysis_error"
+          echo "had_findings=$had_findings"
+
+          if [ "$had_analysis_error" -ne 0 ]; then
+            echo "❌ Slither analysis failed for one or more files"
+            exit 1
           fi
 
-          echo "Running Slither on $TARGET"
-
-          slither "$TARGET" \
-            --json slither-report.json \
-            --exclude-dependencies \
-            --exclude-informational || true
-
-          # 🔥 CRITICAL FIX: ensure file exists
-          if [ ! -f slither-report.json ]; then
-            echo '{"results": {"detectors": []}}' > slither-report.json
-            echo "⚠️ Slither failed → created empty report"
+          if [ "$had_findings" -ne 0 ]; then
+            echo "❌ Slither found blocking issues"
+            exit 1
           fi
 
-      # ✅ SAFE VALIDATION (NO CRASH)
-      - name: Check for HIGH/MEDIUM Issues
-        run: |
-          python3 << 'EOF'
-          import json, sys, os
+          echo "✅ Slither completed successfully with no blocking findings"
 
-          if not os.path.exists("slither-report.json"):
-              print("⚠️ No report → skipping")
-              sys.exit(0)
-
-          try:
-              with open("slither-report.json") as f:
-                  data = json.load(f)
-          except:
-              print("⚠️ Invalid JSON → skipping")
-              sys.exit(0)
-
-          detectors = data.get("results", {}).get("detectors", [])
-
-          if not detectors:
-              print("✅ No issues found by Slither")
-              sys.exit(0)
-
-          high, medium = [], []
-
-          for d in detectors:
-              impact = d.get("impact", "").lower()
-              confidence = d.get("confidence", "").lower()
-              check = d.get("check", "Unknown")
-              desc = d.get("description", "")
-
-              if impact == "high":
-                  high.append(f"[{check}] {desc[:100]}")
-              elif impact == "medium" and confidence == "high":
-                  medium.append(f"[{check}] {desc[:100]}")
-
-          print("\n" + "="*70)
-
-          if high:
-              print(f"🔴 HIGH issues ({len(high)}):")
-              for i in high:
-                  print(i)
-              print("="*70)
-              sys.exit(1)
-
-          if medium:
-              print(f"🟠 MEDIUM issues ({len(medium)}):")
-              for i in medium:
-                  print(i)
-              print("="*70)
-              sys.exit(1)
-
-          print("✅ No HIGH/MEDIUM issues")
-          print("="*70)
-          sys.exit(0)
-          EOF
-
-      # SARIF (SAFE)
-      - name: Run Slither SARIF
-        run: |
-          slither . --sarif results.sarif || true
-
-      - name: Upload SARIF
-        if: hashFiles('results.sarif') != ''
+      - name: Upload SARIF files
+        if: always() && hashFiles('slither-sarif/*.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: results.sarif
+          sarif_file: slither-sarif
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Slither artifacts
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: slither-reports
-          path: slither-report.json
+          path: |
+            slither-reports/
+            slither-sarif/
 
-  # ─────────────────────────────────────────────
-  # JOB 2: MYTHRIL (FIXED)
-  # ─────────────────────────────────────────────
   mythril:
     name: Mythril Analysis
     runs-on: ubuntu-latest
@@ -159,56 +201,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Mythril
-        run: pip install mythril==0.24.7
-
-      - name: Run Mythril
         run: |
+          python -m pip install --upgrade pip
+          pip install mythril==0.24.7
+
+      - name: Run Mythril on each Solidity file
+        shell: bash
+        run: |
+          set -euo pipefail
+
           mkdir -p mythril-reports
+          had_high=0
 
-          FOUND=0
-          FAILED=0
+          while IFS= read -r contract; do
+            [ -n "$contract" ] || continue
 
-          for contract in *.sol contracts/*.sol; do
-            [ -f "$contract" ] || continue
-            FOUND=1
+            base="$(basename "$contract" .sol)"
+            out="mythril-reports/${base}.json"
 
-            echo "🔍 $contract"
+            echo "=================================================="
+            echo "Analyzing: $contract"
+            echo "=================================================="
 
             myth analyze "$contract" \
               --execution-timeout 120 \
               --output json \
-              > "mythril-reports/$(basename "$contract" .sol).json" 2>&1 || true
-          done
+              > "$out" 2>&1 || true
 
-          if [ $FOUND -eq 0 ]; then
-            echo "⚠️ No contracts found → skipping Mythril"
-            exit 0
-          fi
+            if grep -q '"severity": "High"' "$out"; then
+              echo "❌ HIGH severity issue found in $contract"
+              had_high=1
+            else
+              echo "✅ No HIGH severity issue found in $contract"
+            fi
+          done <<< "${{ needs.check-contracts.outputs.contract_list }}"
 
-          if grep -r '"severity": "High"' mythril-reports/ 2>/dev/null; then
-            echo "❌ HIGH severity issues found"
+          if [ "$had_high" -ne 0 ]; then
             exit 1
           fi
 
-          echo "✅ No HIGH issues"
-          exit 0
-
-      - name: Upload Mythril Reports
-        uses: actions/upload-artifact@v4
+      - name: Upload Mythril reports
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: mythril-reports
           path: mythril-reports/
 
-  # ─────────────────────────────────────────────
-  # FINAL SECURITY GATE
-  # ─────────────────────────────────────────────
   security-gate:
     name: Security Gate
     runs-on: ubuntu-latest
@@ -216,18 +260,22 @@ jobs:
     if: always()
 
     steps:
-      - name: Check Results
+      - name: Check Security Results
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "📋 Security Scan Results:"
           echo "  Slither: ${{ needs.slither.result }}"
           echo "  Mythril: ${{ needs.mythril.result }}"
 
           if [[ "${{ needs.slither.result }}" == "failure" ]] || \
              [[ "${{ needs.mythril.result }}" == "failure" ]]; then
-            echo ""
+            echo
             echo "❌ SECURITY GATE FAILED"
+            echo "Security vulnerabilities or analysis failures detected."
             exit 1
           fi
 
-          echo ""
-          echo "✅ All checks passed!"
+          echo
+          echo "✅ All security checks passed"
